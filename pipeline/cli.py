@@ -8,9 +8,14 @@ Currently implements:
   5. mapping step (bwa-mem2 + samtools): maps clean reads back to contigs.
   6. binning step: MetaBAT2, MaxBin2, and CONCOCT run independently, then
      reconciled with DAS Tool into a final, non-redundant set of bins.
+  7. CheckM2: evaluates completeness/contamination of the final bins.
+  8. GTDB-Tk: taxonomic classification of the final bins.
+  9. BioSurfDB search: Prodigal gene prediction per bin + DIAMOND search
+     against a local BioSurfDB database, summarized by biosurfactant
+     pathway category.
 
-Remaining steps (taxonomy, functional annotation)
-will be added one by one, each invoking its own container.
+Remaining steps (general functional annotation: eggNOG-mapper, antiSMASH,
+HMMER) will be added next.
 """
 
 import sys
@@ -378,6 +383,198 @@ def run_binning_reconcile(
     _run_bash(client, image, script, volumes, "DAS Tool bin reconciliation")
 
 
+def run_checkm2(
+    client: docker.DockerClient,
+    config: dict,
+    project_root: Path,
+) -> None:
+    checkm2_cfg = config["steps"]["checkm2"]
+    image = checkm2_cfg["docker_image"]
+    db_path = project_root / checkm2_cfg["db_path"]
+
+    output_dir = project_root / config["output_dir"]
+    checkm2_output = output_dir / "checkm2"
+
+    volumes = {
+        str(output_dir.resolve()): {"bind": "/output", "mode": "rw"},
+        str(db_path.resolve()): {"bind": "/db", "mode": "ro"},
+    }
+
+    logger.info(f"Running CheckM2 with image '{image}'...")
+
+    container_cmd = [
+        "predict",
+        "--input", "/output/binning/dastool/dastool_DASTool_bins",
+        "--output-directory", "/output/checkm2",
+        "--database_path", "/db/CheckM2_database/uniref100.KO.1.dmnd",
+        "-x", "fa",
+        "--force",
+        "-t", "4",
+    ]
+
+    logs = client.containers.run(
+        image,
+        command=container_cmd,
+        volumes=volumes,
+        remove=True,
+        stdout=True,
+        stderr=True,
+    )
+    logger.info(logs.decode("utf-8", errors="replace"))
+    logger.success(f"CheckM2 finished. Output in {checkm2_output}")
+
+
+def run_gtdbtk(
+    client: docker.DockerClient,
+    config: dict,
+    project_root: Path,
+) -> None:
+    gtdbtk_cfg = config["steps"]["gtdbtk"]
+    image = gtdbtk_cfg["docker_image"]
+    db_path = project_root / gtdbtk_cfg["db_path"]
+
+    output_dir = project_root / config["output_dir"]
+    gtdbtk_output = output_dir / "gtdbtk"
+
+    volumes = {
+        str(output_dir.resolve()): {"bind": "/output", "mode": "rw"},
+        str(db_path.resolve()): {"bind": "/db", "mode": "ro"},
+    }
+
+    env = {"GTDBTK_DATA_PATH": "/db"}
+
+    logger.info(f"Running GTDB-Tk with image '{image}'...")
+
+    container_cmd = [
+        "classify_wf",
+        "--genome_dir", "/output/binning/dastool/dastool_DASTool_bins",
+        "--out_dir", "/output/gtdbtk",
+        "-x", "fa",
+        "--cpus", "4",
+        "--scratch_dir", "/output/gtdbtk/scratch",
+    ]
+
+    logs = client.containers.run(
+        image,
+        command=container_cmd,
+        volumes=volumes,
+        environment=env,
+        remove=True,
+        stdout=True,
+        stderr=True,
+    )
+    logger.info(logs.decode("utf-8", errors="replace"))
+    logger.success(f"GTDB-Tk finished. Output in {gtdbtk_output}")
+
+
+def run_biosurfdb_search(
+    client: docker.DockerClient,
+    config: dict,
+    project_root: Path,
+) -> None:
+    """Predict genes per bin (Prodigal) and search them against the
+    local BioSurfDB DIAMOND database for biosurfactant-related hits.
+    Reuses the dastool image, which already has prodigal and diamond.
+    """
+    biosurfdb_cfg = config["steps"]["biosurfdb"]
+    image = biosurfdb_cfg["docker_image"]
+    db_path = project_root / biosurfdb_cfg["db_path"]
+
+    output_dir = project_root / config["output_dir"]
+    functional_dir = output_dir / "functional" / "biosurfdb"
+    (functional_dir / "proteins").mkdir(parents=True, exist_ok=True)
+    (functional_dir / "hits").mkdir(parents=True, exist_ok=True)
+
+    volumes = {
+        str(output_dir.resolve()): {"bind": "/output", "mode": "rw"},
+        str(db_path.resolve()): {"bind": "/db", "mode": "ro"},
+    }
+
+    script = (
+        "set -e && "
+        "for f in /output/binning/dastool/dastool_DASTool_bins/*.fa; do "
+        '  name=$(basename "$f" .fa); '
+        '  prodigal -i "$f" -a /output/functional/biosurfdb/proteins/${name}.faa '
+        "  -p single -q; "
+        "  diamond blastp "
+        "    -q /output/functional/biosurfdb/proteins/${name}.faa "
+        "    -d /db/biosurfdb.dmnd "
+        "    -o /output/functional/biosurfdb/hits/${name}.tsv "
+        "    --outfmt 6 qseqid sseqid pident length evalue bitscore stitle "
+        "    --evalue 1e-5 --max-target-seqs 1 --threads 4; "
+        "done"
+    )
+
+    _run_bash(client, image, script, volumes, "BioSurfDB gene prediction + DIAMOND search")
+
+
+def summarize_biosurfdb_hits(config: dict, project_root: Path) -> None:
+    """Parse DIAMOND hits against BioSurfDB and map them to biosurfactant
+    pathway categories, producing a summary table. Pure Python — runs on
+    the host, no container needed.
+    """
+    biosurfdb_cfg = config["steps"]["biosurfdb"]
+    db_path = project_root / biosurfdb_cfg["db_path"]
+
+    output_dir = project_root / config["output_dir"]
+    hits_dir = output_dir / "functional" / "biosurfdb" / "hits"
+    summary_path = output_dir / "functional" / "biosurfdb" / "summary.tsv"
+
+    # accession -> category ID
+    acc2id: dict[str, str] = {}
+    with open(db_path / "acc2biosurfdb.map", "r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            parts = line.strip().split("\t")
+            if len(parts) == 2:
+                acc2id[parts[0]] = parts[1]
+
+    # category ID -> category name
+    id2name: dict[str, str] = {}
+    with open(db_path / "biosurfdb.map", "r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            parts = line.strip().split("\t")
+            if len(parts) == 2:
+                id2name[parts[0]] = parts[1]
+
+    rows = []
+    for hits_file in sorted(hits_dir.glob("*.tsv")):
+        bin_name = hits_file.stem
+        with open(hits_file, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                fields = line.rstrip("\n").split("\t")
+                if len(fields) < 6:
+                    continue
+                qseqid, sseqid, pident, length, evalue, bitscore = fields[:6]
+                category_id = acc2id.get(sseqid, "")
+                category_name = id2name.get(category_id, "unknown")
+                rows.append(
+                    {
+                        "bin": bin_name,
+                        "query_gene": qseqid,
+                        "subject_accession": sseqid,
+                        "pident": pident,
+                        "evalue": evalue,
+                        "bitscore": bitscore,
+                        "category_id": category_id,
+                        "category_name": category_name,
+                    }
+                )
+
+    with open(summary_path, "w", encoding="utf-8") as f:
+        f.write(
+            "bin\tquery_gene\tsubject_accession\tpident\tevalue\tbitscore\t"
+            "category_id\tcategory_name\n"
+        )
+        for row in rows:
+            f.write(
+                f"{row['bin']}\t{row['query_gene']}\t{row['subject_accession']}\t"
+                f"{row['pident']}\t{row['evalue']}\t{row['bitscore']}\t"
+                f"{row['category_id']}\t{row['category_name']}\n"
+            )
+
+    logger.success(f"BioSurfDB summary written to {summary_path} ({len(rows)} hits)")
+
+
 @click.command()
 @click.option(
     "--config",
@@ -408,7 +605,13 @@ def main(config_path: Path) -> None:
     run_binning_concoct(client, config, project_root)
     run_binning_reconcile(client, config, project_root)
 
-    # TODO: chain the remaining steps (CheckM2, GTDB-Tk, functional annotation)
+    run_checkm2(client, config, project_root)
+    run_gtdbtk(client, config, project_root)
+
+    run_biosurfdb_search(client, config, project_root)
+    summarize_biosurfdb_hits(config, project_root)
+
+    # TODO: chain the remaining steps (eggNOG-mapper, antiSMASH, HMMER)
 
 
 if __name__ == "__main__":
