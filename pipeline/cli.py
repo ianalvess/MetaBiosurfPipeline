@@ -12,10 +12,10 @@ Currently implements:
   8. GTDB-Tk: taxonomic classification of the final bins.
   9. BioSurfDB search: Prodigal gene prediction per bin + DIAMOND search
      against a local BioSurfDB database, summarized by biosurfactant
-     pathway category.
+     pathway category, plus a top-20 percentage table and a publication-
+     ready stacked bar chart split by identity confidence band.
 
-Remaining steps (general functional annotation: eggNOG-mapper, antiSMASH,
-HMMER) will be added next.
+Remaining steps (antiSMASH, eggNOG-mapper, HMMER) will be added next.
 """
 
 import sys
@@ -451,7 +451,6 @@ def run_gtdbtk(
         "--out_dir", "/output/gtdbtk",
         "-x", "fa",
         "--cpus", "4",
-        "--scratch_dir", "/output/gtdbtk/scratch",
     ]
 
     logs = client.containers.run(
@@ -575,6 +574,113 @@ def summarize_biosurfdb_hits(config: dict, project_root: Path) -> None:
     logger.success(f"BioSurfDB summary written to {summary_path} ({len(rows)} hits)")
 
 
+def generate_biosurfdb_report(config: dict, project_root: Path) -> None:
+    """Build a publication-ready summary table and stacked bar chart from
+    the BioSurfDB hits: top 20 functional categories by hit count, with
+    each bar split by DIAMOND identity confidence band.
+    """
+    import pandas as pd
+    import matplotlib.pyplot as plt
+
+    output_dir = project_root / config["output_dir"]
+    summary_path = output_dir / "functional" / "biosurfdb" / "summary.tsv"
+    report_dir = output_dir / "functional" / "biosurfdb" / "report"
+    report_dir.mkdir(parents=True, exist_ok=True)
+
+    df = pd.read_csv(summary_path, sep="\t")
+    df["pident"] = df["pident"].astype(float)
+
+    def confidence_band(pident: float) -> str:
+        if pident < 30:
+            return "<30% identity"
+        elif pident < 50:
+            return "30-50% identity"
+        elif pident < 70:
+            return "50-70% identity"
+        else:
+            return "\u226570% identity"
+
+    df["confidence"] = df["pident"].apply(confidence_band)
+
+    total_hits = len(df)
+    top20 = (
+        df.groupby("category_name")
+        .size()
+        .sort_values(ascending=False)
+        .head(20)
+        .index
+    )
+
+    # Percentage table
+    table = (
+        df[df["category_name"].isin(top20)]
+        .groupby("category_name")
+        .size()
+        .reindex(top20)
+        .reset_index(name="hit_count")
+    )
+    table["percentage_of_total_hits"] = (
+        table["hit_count"] / total_hits * 100
+    ).round(2)
+    table_path = report_dir / "top20_categories.csv"
+    table.to_csv(table_path, index=False)
+    logger.success(f"Top-20 category table written to {table_path}")
+
+    # Stacked bar chart: category x confidence band, as % of total hits
+    pivot = (
+        df[df["category_name"].isin(top20)]
+        .groupby(["category_name", "confidence"])
+        .size()
+        .unstack(fill_value=0)
+        .reindex(top20)
+    )
+    pivot_pct = pivot / total_hits * 100
+
+    band_order = ["<30% identity", "30-50% identity", "50-70% identity", "\u226570% identity"]
+    band_colors = ["#d73027", "#fc8d59", "#91bfdb", "#4575b4"]
+    pivot_pct = pivot_pct[[b for b in band_order if b in pivot_pct.columns]]
+
+    fig, ax = plt.subplots(figsize=(10, 7))
+    bottom = pd.Series(0.0, index=pivot_pct.index)
+    for band, color in zip(band_order, band_colors):
+        if band not in pivot_pct.columns:
+            continue
+        ax.barh(
+            pivot_pct.index,
+            pivot_pct[band],
+            left=bottom,
+            label=band,
+            color=color,
+            edgecolor="white",
+            linewidth=0.5,
+        )
+        bottom += pivot_pct[band]
+
+    ax.set_xlabel("Percentage of total DIAMOND hits (%)", fontsize=11)
+    ax.set_ylabel("")
+    ax.set_title(
+        "Top 20 BioSurfDB Functional Categories\n"
+        "by Hit Percentage and Identity Confidence",
+        fontsize=13,
+        fontweight="bold",
+    )
+    ax.invert_yaxis()
+    ax.legend(
+        title="DIAMOND identity",
+        bbox_to_anchor=(1.02, 1),
+        loc="upper left",
+        frameon=False,
+    )
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    fig.tight_layout()
+
+    chart_path = report_dir / "top20_categories_stacked.png"
+    fig.savefig(chart_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    logger.success(f"Stacked bar chart written to {chart_path}")
+
+
 @click.command()
 @click.option(
     "--config",
@@ -610,8 +716,9 @@ def main(config_path: Path) -> None:
 
     run_biosurfdb_search(client, config, project_root)
     summarize_biosurfdb_hits(config, project_root)
+    generate_biosurfdb_report(config, project_root)
 
-    # TODO: chain the remaining steps (eggNOG-mapper, antiSMASH, HMMER)
+    # TODO: chain the remaining steps (antiSMASH, eggNOG-mapper, HMMER)
 
 
 if __name__ == "__main__":
