@@ -14,8 +14,11 @@ Currently implements:
      against a local BioSurfDB database, summarized by biosurfactant
      pathway category, plus a top-20 percentage table and a publication-
      ready stacked bar chart split by identity confidence band.
+  10. antiSMASH: detects complete biosynthetic gene clusters (BGCs) per
+      bin, confirming whether BioSurfDB hits sit inside real NRPS/PKS
+      operons or are isolated weak-homology genes.
 
-Remaining steps (antiSMASH, eggNOG-mapper, HMMER) will be added next.
+Remaining steps (eggNOG-mapper, HMMER) will be added next.
 """
 
 import sys
@@ -681,6 +684,45 @@ def generate_biosurfdb_report(config: dict, project_root: Path) -> None:
     logger.success(f"Stacked bar chart written to {chart_path}")
 
 
+def run_antismash(
+    client: docker.DockerClient,
+    config: dict,
+    project_root: Path,
+) -> None:
+    """Run antiSMASH on each final bin to detect complete biosynthetic
+    gene clusters (BGCs) — confirms whether BioSurfDB hits are part of
+    real NRPS/PKS operons or isolated weak-homology genes.
+    """
+    antismash_cfg = config["steps"]["antismash"]
+    image = antismash_cfg["docker_image"]
+    db_path = project_root / antismash_cfg["db_path"]
+
+    output_dir = project_root / config["output_dir"]
+    antismash_output = output_dir / "functional" / "antismash"
+
+    volumes = {
+        str(output_dir.resolve()): {"bind": "/output", "mode": "rw"},
+        str(db_path.resolve()): {"bind": "/db", "mode": "ro"},
+    }
+
+    script = (
+        "set -e && "
+        "for f in /output/binning/dastool/dastool_DASTool_bins/*.fa; do "
+        '  name=$(basename "$f" .fa); '
+        "  antismash "
+        '    "$f" '
+        "    --output-dir /output/functional/antismash/${name} "
+        "    --databases /db "
+        "    --genefinding-tool prodigal "
+        "    --cb-general "
+        "    --cpus 4; "
+        "done"
+    )
+
+    _run_bash(client, image, script, volumes, "antiSMASH biosynthetic gene cluster detection")
+    logger.success(f"antiSMASH finished. Output in {antismash_output}")
+
+
 @click.command()
 @click.option(
     "--config",
@@ -718,7 +760,9 @@ def main(config_path: Path) -> None:
     summarize_biosurfdb_hits(config, project_root)
     generate_biosurfdb_report(config, project_root)
 
-    # TODO: chain the remaining steps (antiSMASH, eggNOG-mapper, HMMER)
+    run_antismash(client, config, project_root)
+
+    # TODO: chain the remaining steps (eggNOG-mapper, HMMER)
 
 
 if __name__ == "__main__":
