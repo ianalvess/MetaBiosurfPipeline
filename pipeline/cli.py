@@ -699,6 +699,7 @@ def run_antismash(
 
     output_dir = project_root / config["output_dir"]
     antismash_output = output_dir / "functional" / "antismash"
+    antismash_output.mkdir(parents=True, exist_ok=True)
 
     volumes = {
         str(output_dir.resolve()): {"bind": "/output", "mode": "rw"},
