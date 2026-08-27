@@ -9,16 +9,12 @@ Currently implements:
   6. binning step: MetaBAT2, MaxBin2, and CONCOCT run independently, then
      reconciled with DAS Tool into a final, non-redundant set of bins.
   7. CheckM2: evaluates completeness/contamination of the final bins.
-  8. GTDB-Tk: taxonomic classification of the final bins.
+  8. GTDB-Tk: taxonomic classification of the final bins, plus a
+     publication-ready graphical summary of the classification.
   9. BioSurfDB search: Prodigal gene prediction per bin + DIAMOND search
      against a local BioSurfDB database, summarized by biosurfactant
-     pathway category, plus a top-20 percentage table and a publication-
-     ready stacked bar chart split by identity confidence band.
-  10. antiSMASH: detects complete biosynthetic gene clusters (BGCs) per
-      bin, confirming whether BioSurfDB hits sit inside real NRPS/PKS
-      operons or are isolated weak-homology genes.
-
-Remaining steps (eggNOG-mapper, HMMER) will be added next.
+     pathway category, with two reports: a top-20 table/chart split by
+     identity confidence, and a whole-sample (all bins combined) view.
 """
 
 import sys
@@ -454,6 +450,7 @@ def run_gtdbtk(
         "--out_dir", "/output/gtdbtk",
         "-x", "fa",
         "--cpus", "4",
+        "--pplacer_cpus", "1",
     ]
 
     logs = client.containers.run(
@@ -467,6 +464,94 @@ def run_gtdbtk(
     )
     logger.info(logs.decode("utf-8", errors="replace"))
     logger.success(f"GTDB-Tk finished. Output in {gtdbtk_output}")
+
+
+def generate_taxonomy_report(config: dict, project_root: Path) -> None:
+    """Build a publication-ready horizontal bar chart summarizing the
+    GTDB-Tk taxonomic classification of every final bin (species-level
+    when available, colored by domain). Pure Python — no container needed.
+    """
+    import pandas as pd
+    import matplotlib.pyplot as plt
+    import matplotlib.patches as mpatches
+
+    output_dir = project_root / config["output_dir"]
+    gtdbtk_dir = output_dir / "gtdbtk"
+    report_dir = output_dir / "gtdbtk" / "report"
+    report_dir.mkdir(parents=True, exist_ok=True)
+
+    # GTDB-Tk classify_wf writes one summary per domain, at the top level
+    # of the output dir (or, when only the ANI-screening step ran, inside
+    # classify/ani_screen/). Check both locations.
+    candidates = {
+        "Bacteria": [
+            gtdbtk_dir / "gtdbtk.bac120.summary.tsv",
+            gtdbtk_dir / "classify" / "ani_screen" / "gtdbtk.bac120.ani_summary.tsv",
+        ],
+        "Archaea": [
+            gtdbtk_dir / "gtdbtk.ar53.summary.tsv",
+            gtdbtk_dir / "classify" / "ani_screen" / "gtdbtk.ar53.ani_summary.tsv",
+        ],
+    }
+
+    rows = []
+    for domain, paths in candidates.items():
+        for path in paths:
+            if not path.exists():
+                continue
+            df = pd.read_csv(path, sep="\t")
+            tax_col = "classification" if "classification" in df.columns else "reference_taxonomy"
+            for _, row in df.iterrows():
+                lineage = str(row[tax_col])
+                parts = lineage.split(";")
+                taxon = "unclassified"
+                for part in reversed(parts):
+                    part = part.strip()
+                    if len(part) > 3 and part[2:]:
+                        taxon = part
+                        break
+                rows.append({"bin": row["user_genome"], "domain": domain, "taxon": taxon})
+            break  # use the first file found for this domain, skip the fallback
+
+    if not rows:
+        logger.warning("No GTDB-Tk summary files found — skipping taxonomy report.")
+        return
+
+    df = pd.DataFrame(rows).drop_duplicates(subset="bin").sort_values(["domain", "taxon"])
+
+    domain_colors = {"Bacteria": "#4575b4", "Archaea": "#d73027"}
+    colors = df["domain"].map(domain_colors)
+
+    fig, ax = plt.subplots(figsize=(10, max(4, 0.4 * len(df))))
+    labels = [f"{row['bin']}  —  {row['taxon']}" for _, row in df.iterrows()]
+    ax.barh(labels, [1] * len(df), color=colors, edgecolor="white", linewidth=0.5)
+
+    ax.set_xticks([])
+    ax.set_xlim(0, 1)
+    ax.set_title(
+        "GTDB-Tk Taxonomic Classification of Recovered Bins",
+        fontsize=13,
+        fontweight="bold",
+    )
+    ax.invert_yaxis()
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.spines["bottom"].set_visible(False)
+
+    legend_handles = [
+        mpatches.Patch(color=color, label=domain) for domain, color in domain_colors.items()
+    ]
+    ax.legend(handles=legend_handles, loc="lower right", frameon=False)
+
+    fig.tight_layout()
+    chart_path = report_dir / "taxonomy_summary.png"
+    fig.savefig(chart_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    logger.success(f"Taxonomy chart written to {chart_path}")
+
+    table_path = report_dir / "taxonomy_summary.csv"
+    df.to_csv(table_path, index=False)
+    logger.success(f"Taxonomy table written to {table_path}")
 
 
 def run_biosurfdb_search(
@@ -684,44 +769,57 @@ def generate_biosurfdb_report(config: dict, project_root: Path) -> None:
     logger.success(f"Stacked bar chart written to {chart_path}")
 
 
-def run_antismash(
-    client: docker.DockerClient,
-    config: dict,
-    project_root: Path,
-) -> None:
-    """Run antiSMASH on each final bin to detect complete biosynthetic
-    gene clusters (BGCs) — confirms whether BioSurfDB hits are part of
-    real NRPS/PKS operons or isolated weak-homology genes.
+def generate_biosurfdb_global_report(config: dict, project_root: Path) -> None:
+    """Build a whole-sample view of the BioSurfDB results: all bins
+    combined into a single global picture (no per-bin or per-confidence
+    breakdown), showing the top 20 functional categories as a percentage
+    of the total sample's hits.
     """
-    antismash_cfg = config["steps"]["antismash"]
-    image = antismash_cfg["docker_image"]
-    db_path = project_root / antismash_cfg["db_path"]
+    import pandas as pd
+    import matplotlib.pyplot as plt
 
     output_dir = project_root / config["output_dir"]
-    antismash_output = output_dir / "functional" / "antismash"
-    antismash_output.mkdir(parents=True, exist_ok=True)
+    summary_path = output_dir / "functional" / "biosurfdb" / "summary.tsv"
+    report_dir = output_dir / "functional" / "biosurfdb" / "report"
+    report_dir.mkdir(parents=True, exist_ok=True)
 
-    volumes = {
-        str(output_dir.resolve()): {"bind": "/output", "mode": "rw"},
-        str(db_path.resolve()): {"bind": "/db", "mode": "ro"},
-    }
+    df = pd.read_csv(summary_path, sep="\t")
+    total_hits = len(df)
 
-    script = (
-        "set -e && "
-        "for f in /output/binning/dastool/dastool_DASTool_bins/*.fa; do "
-        '  name=$(basename "$f" .fa); '
-        "  antismash "
-        '    "$f" '
-        "    --output-dir /output/functional/antismash/${name} "
-        "    --databases /db "
-        "    --genefinding-tool prodigal "
-        "    --cb-general "
-        "    --cpus 4; "
-        "done"
+    counts = df.groupby("category_name").size().sort_values(ascending=False)
+    top20 = counts.head(20)
+    top20_pct = (top20 / total_hits * 100).round(2)
+
+    table = top20.reset_index(name="hit_count")
+    table["percentage_of_total_hits"] = top20_pct.values
+    table_path = report_dir / "global_sample_categories.csv"
+    table.to_csv(table_path, index=False)
+    logger.success(f"Global sample category table written to {table_path}")
+
+    fig, ax = plt.subplots(figsize=(9, 7))
+    ax.barh(
+        top20_pct.index[::-1],
+        top20_pct.values[::-1],
+        color="#4575b4",
+        edgecolor="white",
+        linewidth=0.5,
     )
+    ax.set_xlabel("Percentage of total sample hits (%)", fontsize=11)
+    ax.set_ylabel("")
+    ax.set_title(
+        "BioSurfDB Functional Categories — Whole Sample\n"
+        "Top 20 categories, all bins combined",
+        fontsize=13,
+        fontweight="bold",
+    )
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    fig.tight_layout()
 
-    _run_bash(client, image, script, volumes, "antiSMASH biosynthetic gene cluster detection")
-    logger.success(f"antiSMASH finished. Output in {antismash_output}")
+    chart_path = report_dir / "global_sample_categories.png"
+    fig.savefig(chart_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    logger.success(f"Global sample chart written to {chart_path}")
 
 
 @click.command()
@@ -756,14 +854,12 @@ def main(config_path: Path) -> None:
 
     run_checkm2(client, config, project_root)
     run_gtdbtk(client, config, project_root)
+    generate_taxonomy_report(config, project_root)
 
     run_biosurfdb_search(client, config, project_root)
     summarize_biosurfdb_hits(config, project_root)
     generate_biosurfdb_report(config, project_root)
-
-    run_antismash(client, config, project_root)
-
-    # TODO: chain the remaining steps (eggNOG-mapper, HMMER)
+    generate_biosurfdb_global_report(config, project_root)
 
 
 if __name__ == "__main__":
