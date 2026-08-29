@@ -9,8 +9,9 @@ Currently implements:
   6. binning step: MetaBAT2, MaxBin2, and CONCOCT run independently, then
      reconciled with DAS Tool into a final, non-redundant set of bins.
   7. CheckM2: evaluates completeness/contamination of the final bins.
-  8. GTDB-Tk: taxonomic classification of the final bins, plus a
-     publication-ready graphical summary of the classification.
+  8. Kraken2: whole-sample taxonomic classification run directly on the
+     clean reads (low-memory, fits comfortably in 32GB RAM), with a
+     publication-ready graphical summary of the top taxa.
   9. BioSurfDB search: Prodigal gene prediction per bin + DIAMOND search
      against a local BioSurfDB database, summarized by biosurfactant
      pathway category, with two reports: a top-20 table/chart split by
@@ -423,135 +424,124 @@ def run_checkm2(
     logger.success(f"CheckM2 finished. Output in {checkm2_output}")
 
 
-def run_gtdbtk(
+def run_kraken2(
     client: docker.DockerClient,
     config: dict,
     project_root: Path,
+    clean_reads: dict,
 ) -> None:
-    gtdbtk_cfg = config["steps"]["gtdbtk"]
-    image = gtdbtk_cfg["docker_image"]
-    db_path = project_root / gtdbtk_cfg["db_path"]
+    """Run Kraken2 directly on the clean reads for a whole-sample taxonomic
+    classification. Low memory footprint (capped database), no dependency
+    on binning/assembly for this step.
+    """
+    kraken2_cfg = config["steps"]["kraken2"]
+    image = kraken2_cfg["docker_image"]
+    db_path = project_root / kraken2_cfg["db_path"]
 
     output_dir = project_root / config["output_dir"]
-    gtdbtk_output = output_dir / "gtdbtk"
+    kraken2_output = output_dir / "kraken2"
+    kraken2_output.mkdir(parents=True, exist_ok=True)
 
     volumes = {
         str(output_dir.resolve()): {"bind": "/output", "mode": "rw"},
         str(db_path.resolve()): {"bind": "/db", "mode": "ro"},
     }
 
-    env = {"GTDBTK_DATA_PATH": "/db"}
-
-    logger.info(f"Running GTDB-Tk with image '{image}'...")
-
     container_cmd = [
-        "classify_wf",
-        "--genome_dir", "/output/binning/dastool/dastool_DASTool_bins",
-        "--out_dir", "/output/gtdbtk",
-        "-x", "fa",
-        "--cpus", "4",
-        "--pplacer_cpus", "1",
+        "--db", "/db",
+        "--threads", "4",
+        "--report", "/output/kraken2/kraken2_report.txt",
+        "--output", "/output/kraken2/kraken2_output.txt",
+        "--use-names",
     ]
+
+    if "r2" in clean_reads:
+        container_cmd += [
+            "--paired",
+            f"/output/{clean_reads['r1'].name}",
+            f"/output/{clean_reads['r2'].name}",
+        ]
+    else:
+        container_cmd += [f"/output/{clean_reads['r1'].name}"]
+
+    logger.info(f"Running Kraken2 with image '{image}'...")
 
     logs = client.containers.run(
         image,
         command=container_cmd,
         volumes=volumes,
-        environment=env,
         remove=True,
         stdout=True,
         stderr=True,
     )
     logger.info(logs.decode("utf-8", errors="replace"))
-    logger.success(f"GTDB-Tk finished. Output in {gtdbtk_output}")
+    logger.success(f"Kraken2 finished. Output in {kraken2_output}")
 
 
-def generate_taxonomy_report(config: dict, project_root: Path) -> None:
-    """Build a publication-ready horizontal bar chart summarizing the
-    GTDB-Tk taxonomic classification of every final bin (species-level
-    when available, colored by domain). Pure Python — no container needed.
+def generate_kraken2_report(config: dict, project_root: Path) -> None:
+    """Build publication-ready horizontal bar charts of the top species-
+    and genus-level taxa found in the whole sample by Kraken2, plus CSV
+    tables for each. Pure Python — no container needed.
     """
     import pandas as pd
     import matplotlib.pyplot as plt
-    import matplotlib.patches as mpatches
 
     output_dir = project_root / config["output_dir"]
-    gtdbtk_dir = output_dir / "gtdbtk"
-    report_dir = output_dir / "gtdbtk" / "report"
+    report_path = output_dir / "kraken2" / "kraken2_report.txt"
+    report_dir = output_dir / "kraken2" / "report"
     report_dir.mkdir(parents=True, exist_ok=True)
 
-    # GTDB-Tk classify_wf writes one summary per domain, at the top level
-    # of the output dir (or, when only the ANI-screening step ran, inside
-    # classify/ani_screen/). Check both locations.
-    candidates = {
-        "Bacteria": [
-            gtdbtk_dir / "gtdbtk.bac120.summary.tsv",
-            gtdbtk_dir / "classify" / "ani_screen" / "gtdbtk.bac120.ani_summary.tsv",
-        ],
-        "Archaea": [
-            gtdbtk_dir / "gtdbtk.ar53.summary.tsv",
-            gtdbtk_dir / "classify" / "ani_screen" / "gtdbtk.ar53.ani_summary.tsv",
-        ],
-    }
-
-    rows = []
-    for domain, paths in candidates.items():
-        for path in paths:
-            if not path.exists():
-                continue
-            df = pd.read_csv(path, sep="\t")
-            tax_col = "classification" if "classification" in df.columns else "reference_taxonomy"
-            for _, row in df.iterrows():
-                lineage = str(row[tax_col])
-                parts = lineage.split(";")
-                taxon = "unclassified"
-                for part in reversed(parts):
-                    part = part.strip()
-                    if len(part) > 3 and part[2:]:
-                        taxon = part
-                        break
-                rows.append({"bin": row["user_genome"], "domain": domain, "taxon": taxon})
-            break  # use the first file found for this domain, skip the fallback
-
-    if not rows:
-        logger.warning("No GTDB-Tk summary files found — skipping taxonomy report.")
+    if not report_path.exists():
+        logger.warning(f"Kraken2 report not found at {report_path} — skipping taxonomy report.")
         return
 
-    df = pd.DataFrame(rows).drop_duplicates(subset="bin").sort_values(["domain", "taxon"])
-
-    domain_colors = {"Bacteria": "#4575b4", "Archaea": "#d73027"}
-    colors = df["domain"].map(domain_colors)
-
-    fig, ax = plt.subplots(figsize=(10, max(4, 0.4 * len(df))))
-    labels = [f"{row['bin']}  —  {row['taxon']}" for _, row in df.iterrows()]
-    ax.barh(labels, [1] * len(df), color=colors, edgecolor="white", linewidth=0.5)
-
-    ax.set_xticks([])
-    ax.set_xlim(0, 1)
-    ax.set_title(
-        "GTDB-Tk Taxonomic Classification of Recovered Bins",
-        fontsize=13,
-        fontweight="bold",
+    df = pd.read_csv(
+        report_path,
+        sep="\t",
+        header=None,
+        names=["pct", "frag_total", "frag_direct", "rank", "taxid", "name"],
     )
-    ax.invert_yaxis()
-    ax.spines["top"].set_visible(False)
-    ax.spines["right"].set_visible(False)
-    ax.spines["bottom"].set_visible(False)
+    df["name"] = df["name"].str.strip()
 
-    legend_handles = [
-        mpatches.Patch(color=color, label=domain) for domain, color in domain_colors.items()
-    ]
-    ax.legend(handles=legend_handles, loc="lower right", frameon=False)
+    def build_chart(rank_code: str, rank_label: str, filename_stem: str) -> None:
+        subset = df[df["rank"] == rank_code].sort_values("pct", ascending=False).head(10)
+        if subset.empty:
+            logger.warning(f"No {rank_label}-level taxa found in Kraken2 report — skipping chart.")
+            return
 
-    fig.tight_layout()
-    chart_path = report_dir / "taxonomy_summary.png"
-    fig.savefig(chart_path, dpi=300, bbox_inches="tight")
-    plt.close(fig)
-    logger.success(f"Taxonomy chart written to {chart_path}")
+        table_path = report_dir / f"{filename_stem}.csv"
+        subset[["name", "pct", "frag_total"]].rename(
+            columns={"pct": "percentage_of_reads", "frag_total": "read_count"}
+        ).to_csv(table_path, index=False)
+        logger.success(f"Top-10 {rank_label} table written to {table_path}")
 
-    table_path = report_dir / "taxonomy_summary.csv"
-    df.to_csv(table_path, index=False)
-    logger.success(f"Taxonomy table written to {table_path}")
+        fig, ax = plt.subplots(figsize=(9, 5.5))
+        ax.barh(
+            subset["name"][::-1],
+            subset["pct"][::-1],
+            color="#4575b4",
+            edgecolor="white",
+            linewidth=0.5,
+        )
+        ax.set_xlabel("Percentage of classified reads (%)", fontsize=11)
+        ax.set_ylabel("")
+        ax.set_title(
+            f"Kraken2 Taxonomic Classification — Whole Sample\n"
+            f"Top 10 {rank_label} by read percentage",
+            fontsize=13,
+            fontweight="bold",
+        )
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        fig.tight_layout()
+
+        chart_path = report_dir / f"{filename_stem}.png"
+        fig.savefig(chart_path, dpi=300, bbox_inches="tight")
+        plt.close(fig)
+        logger.success(f"{rank_label.capitalize()} chart written to {chart_path}")
+
+    build_chart("S", "species", "top10_species")
+    build_chart("G", "genus", "top10_genus")
 
 
 def run_biosurfdb_search(
@@ -853,8 +843,9 @@ def main(config_path: Path) -> None:
     run_binning_reconcile(client, config, project_root)
 
     run_checkm2(client, config, project_root)
-    run_gtdbtk(client, config, project_root)
-    generate_taxonomy_report(config, project_root)
+
+    run_kraken2(client, config, project_root, clean_reads)
+    generate_kraken2_report(config, project_root)
 
     run_biosurfdb_search(client, config, project_root)
     summarize_biosurfdb_hits(config, project_root)
