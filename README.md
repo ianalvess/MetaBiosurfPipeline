@@ -1,4 +1,4 @@
-# metagen-biosurf
+# MetaBiosurfPipeline 
 
 Automated metagenomics pipeline for taxonomic and functional identification of biosurfactant-producing organisms in extreme environments.
 
